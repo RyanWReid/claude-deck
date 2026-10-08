@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Package for Decky
+        run: |
+          mkdir -p out/claude-deck/dist
+          cp plugin.json package.json main.py steam_mcp.py deck_tools.py LICENSE README.md out/claude-deck/
+          cp dist/index.js out/claude-deck/dist/
+          cd out && zip -r claude-deck.zip claude-deck
+      - name: Build a static whisper-cli for the in-plugin voice setup
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq build-essential cmake
+          git clone -q --depth 1 https://github.com/ggml-org/whisper.cpp /tmp/whisper
+          cmake -S /tmp/whisper -B /tmp/whisper/build -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF -DCMAKE_EXE_LINKER_FLAGS=-static
+          cmake --build /tmp/whisper/build -j"$(nproc)" --target whisper-cli
+          cp /tmp/whisper/build/bin/whisper-cli out/whisper-cli-linux-x86_64
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            out/claude-deck.zip
+            out/whisper-cli-linux-x86_64
+          generate_release_notes: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-deck
+          path: |
+            out/claude-deck.zip
+            out/whisper-cli-linux-x86_64

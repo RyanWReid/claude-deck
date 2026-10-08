@@ -1,0 +1,11 @@
+{
+  "name": "Claude",
+  "author": "Ryan Reid",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["ai", "assistant", "voice"],
+    "description": "Your Claude Code in the Quick Access menu: look at your game, talk it through, and control your Deck.",
+    "image": "https://raw.githubusercontent.com/RyanWReid/claude-deck/master/docs/media/banner.png"
+  }
+}
