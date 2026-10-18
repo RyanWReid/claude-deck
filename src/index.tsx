@@ -33,7 +33,7 @@ import { CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "rea
 import { Ask, AskCard, ghostBtn, primaryBtn } from "./asks";
 import { Icon, IconName, toolIcon } from "./icons";
 import { Markdown } from "./markdown";
-import { SetupCard, UpdateRow, pluginVersion } from "./setup";
+import { SetupCard, SignInBanner, UpdateRow, onAuthEvent, pluginVersion } from "./setup";
 import { SignInCard, installSignInBridge, pendingSignIns, qrDataUrl } from "./signin";
 import { CSS, THEMES, ThemeId, installFonts, themeById, themeVars, v } from "./theme";
 
@@ -240,6 +240,7 @@ const handlers: [string, (x: any) => void][] = [
   ["claude_speaking", (on: boolean) => ((speaking = on), notify())],
   ["claude_ptt", (e: any) => onPtt(e)],
   ["claude_chat", () => getState().then((st) => (applyState(st), (streaming = ""), notify()))],
+  ["claude_auth", onAuthEvent],
   ["claude_setup", (e: any) => e?.done && !e.error && voiceAvailable().then((ok) => ((hasVoice = ok), notify()))],
 ];
 
@@ -1041,6 +1042,7 @@ function ChatPage() {
 
         <div ref={scroller} style={{ flex: 1, overflowY: "auto", display: "flex", justifyContent: "center" }}>
           <div style={{ width: "780px", maxWidth: "calc(100% - 48px)", padding: "28px 0 16px", display: "flex", flexDirection: "column", gap: "18px" }}>
+            <SignInBanner />
             {turns.length === 0 && !running && (
               <div className="cd-fade" style={{ textAlign: "center", marginTop: "64px", display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
                 <Spark size={40} />

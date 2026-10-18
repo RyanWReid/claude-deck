@@ -110,6 +110,13 @@ and finish with `notify-send "Claude" "<result>"` so the user sees it. The plugi
 under Jobs. Timers only fire while the Deck is awake."""
 
 
+# Claude Code's ways of saying the login is gone (expired OAuth, logged out, bad key).
+_AUTH_RE = re.compile(r"Failed to authenticate|OAuth (session|token)[^\n]*(expired|revoked|invalid)|"
+                      r"authentication_failed|Not logged in|Please run /login|Invalid API key|invalid x-api-key", re.I)
+_ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]")
+SIGNED_OUT_MSG = "You're signed out of Claude. Tap Sign in at the top, then send your message again."
+
+
 def _clip(s, n):
     s = str(s)
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -261,6 +268,7 @@ class Plugin:
         self.chat_meta = {}  # meta for the current chat until it has a session id
         self.game_threads = True  # questions asked in a game go to that game's own chat
         self.login_proc = None
+        self.auth_lost = False  # this turn failed because the login is gone
         self.ptt_role = None
         self.caption_up = False  # the over-game caption is showing (frontend tells us)
         self.ptt_t0 = 0
@@ -525,6 +533,8 @@ class Plugin:
                 info = json.loads(out[out.find("{"):]) if "{" in out else {}
                 st["signed_in"] = bool(info.get("loggedIn"))
                 st["plan"] = info.get("subscriptionType") or info.get("authMethod")
+                if st["signed_in"]:
+                    self.auth_lost = False
             except Exception:
                 decky.logger.exception("setup_status")
         return st
@@ -545,42 +555,72 @@ class Plugin:
             return {"ok": False, "log": str(e)}
 
     async def login_start(self):
-        """Begin Claude sign-in; returns the URL to open (the code comes back via login_finish)."""
+        """Begin Claude sign-in; returns the URL to open (the code comes back via login_finish).
+
+        `claude auth login --claudeai` prints "Opening browser to sign in…", then
+        "If the browser didn't open, visit: <url>", then "Paste code here if prompted >" and reads
+        the code from stdin. Return as soon as a whole URL has arrived (whitespace after it, or
+        nothing more for a moment), without waiting for the prompt line."""
         await self._login_cancel()
         env = _env() | {"BROWSER": "true"}  # no browser on the Deck: just print the link
-        self.login_proc = await asyncio.create_subprocess_exec(
-            CLAUDE, "auth", "login", "--claudeai", env=env, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        buf = ""
         try:
-            while True:
-                chunk = await asyncio.wait_for(self.login_proc.stdout.read(4096), 30)
-                if not chunk:
+            self.login_proc = await asyncio.create_subprocess_exec(
+                CLAUDE, "auth", "login", "--claudeai", env=env, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        except OSError as e:
+            return {"error": f"Couldn't run Claude Code: {e}", "log": ""}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30
+        buf, url, ended = "", None, False
+        while (wait := deadline - loop.time()) > 0:
+            try:
+                chunk = await asyncio.wait_for(self.login_proc.stdout.read(4096), wait)
+            except asyncio.TimeoutError:
+                break
+            if not chunk:
+                ended = True
+                break
+            buf += chunk.decode(errors="replace")
+            text = _ANSI_RE.sub("", buf)
+            m = re.search(r"https://\S+", text)
+            if m:
+                url = m.group(0)
+                if m.end() < len(text):  # something follows, so the URL is complete
                     break
-                buf += chunk.decode(errors="replace")
-                m = re.search(r"https://\S+", buf)
-                if m and ("Paste" in buf or "code" in buf[m.end():]):
-                    return {"url": m.group(0)}
-        except asyncio.TimeoutError:
-            pass
+                deadline = min(deadline, loop.time() + 1.5)  # it may continue in the next chunk
+        if url and not ended:
+            return {"url": url}
+        log = _ANSI_RE.sub("", buf).strip()[-400:]
+        decky.logger.warning("login_start: no sign-in link (%s)", log)
         await self._login_cancel()
-        return {"error": "Claude Code didn't show a sign-in link", "log": buf[-400:]}
+        return {"error": "Claude Code didn't show a sign-in link." if not ended else "Claude Code stopped before showing a sign-in link.",
+                "log": log}
 
     async def login_finish(self, code):
         p = getattr(self, "login_proc", None)
         if not p or p.returncode is not None:
             return {"error": "Sign-in expired. Start again."}
-        p.stdin.write((code.strip() + "\n").encode())
-        await p.stdin.drain()
         try:
-            await asyncio.wait_for(p.wait(), 60)
+            p.stdin.write((code.strip() + "\n").encode())
+            await p.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            await self._login_cancel()
+            return {"error": "Sign-in expired. Start again."}
+        try:
+            out = await asyncio.wait_for(p.stdout.read(), 60)  # the rest of its output, until it exits
+            await asyncio.wait_for(p.wait(), 10)
         except asyncio.TimeoutError:
             await self._login_cancel()
             return {"error": "Sign-in didn't finish. Check the code and try again."}
+        self.login_proc = None
         st = await self.setup_status()
         if st["signed_in"]:
             await self._kill()  # the next message starts Claude with the new login
-        return {"ok": st["signed_in"], "plan": st["plan"]}
+            await decky.emit("claude_auth", {"signed_in": True})
+            return {"ok": True, "plan": st["plan"]}
+        log = _ANSI_RE.sub("", out.decode(errors="replace")).strip()[-400:]
+        decky.logger.warning("login_finish failed: %s", log)
+        return {"error": "That code didn't work. Start again and paste the new code.", "log": log}
 
     async def _login_cancel(self):
         p = getattr(self, "login_proc", None)
@@ -1037,6 +1077,9 @@ class Plugin:
                 await decky.emit("claude_ask_done", rid)
             if (self.inflight or self.turn_active) and not self.stopping:
                 msg = stderr_tail.decode(errors="replace").strip() or f"Claude exited with code {proc.returncode}"
+                if _AUTH_RE.search(msg):
+                    await self._signed_out()
+                    msg = SIGNED_OUT_MSG
                 await self._push("error", _clip(msg, 600))
             self.inflight = 0
             self.turn_active = False
@@ -1044,6 +1087,13 @@ class Plugin:
             self.turn_text.clear()
             self.remote_url = None
             await self._set_running(False)
+
+    async def _signed_out(self):
+        """Claude Code lost its login mid-session: tell the UI so it shows Sign in again."""
+        if not self.auth_lost:
+            decky.logger.warning("Claude Code is signed out")
+        self.auth_lost = True
+        await decky.emit("claude_auth", {"signed_in": False})
 
     async def _dispatch(self, ev):
         t = ev.get("type")
@@ -1107,6 +1157,10 @@ class Plugin:
             elif e.get("type") == "content_block_stop" and self.tts_on:
                 self._tts_stream("\n", flush=True)
         elif t == "assistant":
+            if ev.get("error") == "authentication_failed" or (ev.get("is_api_error_message") and _AUTH_RE.search(
+                    " ".join(b.get("text", "") for b in ev.get("message", {}).get("content", []) if isinstance(b, dict)))):
+                await self._signed_out()  # the result event right after carries the message
+                return
             for block in ev.get("message", {}).get("content", []):
                 if block.get("type") == "text" and block.get("text", "").strip():
                     self.turn_text.append(block["text"].strip())
@@ -1159,6 +1213,9 @@ class Plugin:
                 else:
                     if "No conversation found" in str(err):
                         self.session_id = None
+                    if _AUTH_RE.search(str(err)):
+                        await self._signed_out()
+                        err = SIGNED_OUT_MSG
                     await self._push("error", _clip(err, 600))
             else:
                 await self._push("done", f"{secs:.0f}s" if secs >= 1 else "")

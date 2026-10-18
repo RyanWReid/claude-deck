@@ -29,21 +29,33 @@ interface Update {
 
 const setupStatus = callable<[], SetupStatus>("setup_status");
 const installClaude = callable<[], { ok: boolean; log: string }>("install_claude");
-const loginStart = callable<[], { url?: string; error?: string }>("login_start");
-const loginFinish = callable<[code: string], { ok?: boolean; error?: string; plan?: string }>("login_finish");
+const loginStart = callable<[], { url?: string; error?: string; log?: string }>("login_start");
+const loginFinish = callable<[code: string], { ok?: boolean; error?: string; plan?: string; log?: string }>("login_finish");
 const setupVoice = callable<[], { ok: boolean; error?: string }>("setup_voice");
 const checkUpdate = callable<[], Update>("check_update");
 
 let status: SetupStatus | null = null;
+let fetchedAt = 0;
 let update: Update | null = null;
 let checkedUpdate = 0;
 const listeners = new Set<() => void>();
 const changed = () => listeners.forEach((f) => f());
 
 export async function refreshSetup() {
+  fetchedAt = Date.now();
   status = await setupStatus().catch(() => status);
   changed();
   return status;
+}
+
+/** `claude_auth` from the backend: a reply failed because the login is gone (or sign-in just
+ * worked). Flip the UI right away so Sign in shows, then confirm with a fresh status. */
+export function onAuthEvent(e: { signed_in: boolean }) {
+  if (status && !e?.signed_in) {
+    status = { ...status, signed_in: false, plan: null };
+    changed();
+  }
+  refreshSetup();
 }
 
 function useSetup() {
@@ -51,7 +63,8 @@ function useSetup() {
   useEffect(() => {
     const f = () => tick((t) => t + 1);
     listeners.add(f);
-    if (!status) refreshSetup();
+    // The panel stays mounted, so also re-check on later mounts (chat page) once it's a minute old.
+    if (!status || Date.now() - fetchedAt > 60e3) refreshSetup();
     if (Date.now() - checkedUpdate > 6 * 3600e3) {
       checkedUpdate = Date.now();
       checkUpdate()
@@ -90,19 +103,50 @@ function SignIn({ onDone }: { onDone: () => void }) {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [log, setLog] = useState("");
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
-    loginStart().then((r) => (r.url ? setUrl(r.url) : setErr(r.error ?? "Couldn't start sign-in")));
-  }, []);
+    setUrl(null);
+    setErr("");
+    setLog("");
+    setCode("");
+    loginStart()
+      .then((r) => {
+        if (r.url) setUrl(r.url);
+        else {
+          setErr(r.error ?? "Couldn't start sign-in");
+          setLog(r.log ?? "");
+        }
+      })
+      .catch((e) => setErr(`Couldn't start sign-in: ${e}`));
+  }, [attempt]);
   const submit = async () => {
     setBusy(true);
-    const r = await loginFinish(code);
+    const r = await loginFinish(code).catch((e) => ({ error: String(e) }) as { ok?: boolean; error?: string; plan?: string; log?: string });
     setBusy(false);
     if (r.ok) {
       toaster.toast({ title: "Signed in to Claude", body: r.plan ? `Plan: ${r.plan}` : "You're all set." });
       onDone();
-    } else setErr(r.error ?? "That code didn't work. Try again.");
+    } else {
+      // The login command has exited by now, so a retry needs a fresh link.
+      setUrl(null);
+      setErr(r.error ?? "That code didn't work. Try again.");
+      setLog(r.log ?? "");
+    }
   };
-  if (err && !url) return <div style={{ fontSize: "12.5px", color: v("warn") }}>{err}</div>;
+  const retry = (
+    <DialogButton className="cd-btn" style={{ ...small, alignSelf: "flex-start" }} onClick={() => setAttempt((a) => a + 1)}>
+      Try again
+    </DialogButton>
+  );
+  if (err && !url)
+    return (
+      <Focusable style={{ display: "flex", flexDirection: "column", gap: "8px", padding: "10px", borderRadius: v("r-sm"), background: v("sunken") }}>
+        <div style={{ fontSize: "12.5px", color: v("warn") }}>{err}</div>
+        {log && <div style={{ fontSize: "11px", color: v("dim"), fontFamily: v("mono"), whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{log}</div>}
+        {retry}
+      </Focusable>
+    );
   if (!url) return <div style={{ fontSize: "12.5px", color: v("dim") }}>Getting a sign-in link…</div>;
   const qr = qrDataUrl(url);
   return (
@@ -120,7 +164,36 @@ function SignIn({ onDone }: { onDone: () => void }) {
         <DialogButton className="cd-btn" style={small} onClick={() => Navigation.NavigateToExternalWeb(url)}>
           Open here
         </DialogButton>
+        <DialogButton className="cd-btn" style={small} disabled={busy} onClick={() => setAttempt((a) => a + 1)}>
+          New link
+        </DialogButton>
       </Focusable>
+    </div>
+  );
+}
+
+/** "Signed out" bar for the top of the full chat page; the panel has the SetupCard instead. */
+export function SignInBanner() {
+  useSetup();
+  const [signing, setSigning] = useState(false);
+  if (!status || !status.claude || status.signed_in) return null;
+  return (
+    <div style={{ boxSizing: "border-box", width: "100%", display: "flex", flexDirection: "column", gap: "8px", padding: "12px", borderRadius: v("r"), background: v("surface"), border: `1px solid ${v("line")}` }}>
+      <Check ok={false} label="Signed out of Claude" detail="Sign in with your Claude account (Pro or Max) to keep chatting.">
+        {!signing && (
+          <DialogButton className="cd-btn" style={small} onClick={() => setSigning(true)}>
+            Sign in
+          </DialogButton>
+        )}
+      </Check>
+      {signing && (
+        <SignIn
+          onDone={() => {
+            setSigning(false);
+            refreshSetup();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -151,7 +224,9 @@ export function SetupCard() {
   };
   return (
     <div style={{ boxSizing: "border-box", width: "100%", display: "flex", flexDirection: "column", gap: "6px", padding: "12px", borderRadius: v("r"), background: v("surface"), border: `1px solid ${v("line")}` }}>
-      <div style={{ fontFamily: v("display"), fontSize: "17px", marginBottom: "2px" }}>Finish setting up</div>
+      <div style={{ fontFamily: v("display"), fontSize: "17px", marginBottom: "2px" }}>
+        {status.claude && status.voice && !status.signed_in ? "Sign in to Claude" : "Finish setting up"}
+      </div>
       <Check ok={status.claude} label="Claude Code" detail={status.claude ? status.version : "Needed to talk to Claude"}>
         <DialogButton className="cd-btn" style={small} disabled={!!busy} onClick={() => run("claude", installClaude)}>
           {busy === "claude" ? "Installing…" : "Install"}
