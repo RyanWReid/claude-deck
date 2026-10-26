@@ -18,6 +18,43 @@ PIPER_DIR = os.path.join(HOME, ".local/share/claude-deck/piper")
 PIPER_BIN = os.path.join(PIPER_DIR, "piper")
 PIPER_VOICE = os.path.join(PIPER_DIR, "en_US-lessac-medium.onnx")
 KEEP_SHOTS = 10
+DEVICE_NAMES = {
+    "product_name": {
+        "83E1": "Legion Go",
+        "83N0": "Legion Go 2",
+        "83N1": "Legion Go 2",
+        "83L3": "Legion Go S",
+        "83N6": "Legion Go S",
+        "83Q2": "Legion Go S",
+        "83Q3": "Legion Go S",
+    },
+    "board_name": {
+        "RC71L": "ROG Ally",
+        "RC72LA": "ROG Ally X",
+        "MS-1T41": "MSI Claw",
+    },
+}
+
+
+def device_name(dmi="/sys/class/dmi/id"):
+    info = {}
+    for key in ("sys_vendor", "product_family", "product_name", "board_name"):
+        try:
+            with open(os.path.join(dmi, key)) as f:
+                info[key] = f.read().strip()
+        except OSError:
+            pass
+    if any(info.get(key, "").lower() in ("jupiter", "galileo") for key in ("product_name", "board_name")):
+        return "Steam Deck"
+    for key, names in DEVICE_NAMES.items():
+        if info.get(key) in names:
+            return names[info[key]]
+    keys = ("product_family", "product_name") if info.get("sys_vendor", "").upper() == "LENOVO" else ("product_name", "product_family")
+    for key in keys:
+        name = info.get(key, "")
+        if name.lower() not in ("", "default string", "to be filled by o.e.m.", "system product name", "unknown", "none"):
+            return name
+    return "Steam Deck"
 
 
 def clean_env():
@@ -283,16 +320,28 @@ def chord_label(spec):
     return " + ".join(names)
 
 
-def find_controller():
-    """The hidraw node of the built-in controller's input interface, or None."""
-    for dev in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+def find_controller(sysfs="/sys/class/hidraw"):
+    """Prefer the built-in Deck input interface, then InputPlumber's Deck emulation."""
+    virtual = None
+    # InputPlumber: src/drivers/steam_deck/mod.rs ProductId (0.78.0).
+    emulated = {0x12F0, 0x12FA, 0x12FB, 0x12FC, 0x12FD, 0x12FE, 0x12FF}
+    for dev in sorted(glob.glob(os.path.join(sysfs, "hidraw*"))):
         try:
-            ev = open(os.path.join(dev, "device/uevent")).read()
-        except OSError:
+            with open(os.path.join(dev, "device/uevent")) as f:
+                ev = f.read()
+            fields = dict(line.split("=", 1) for line in ev.splitlines() if "=" in line)
+            _, vendor, product = (int(x, 16) for x in fields.get("HID_ID", "").split(":"))
+        except (OSError, ValueError):
             continue
-        if "28DE:00001205" in ev.upper() and "input2" in ev:
-            return "/dev/" + os.path.basename(dev)
-    return None
+        if vendor != 0x28DE:
+            continue
+        node = "/dev/" + os.path.basename(dev)
+        uhid = "uhid" in os.path.realpath(os.path.join(dev, "device")).split(os.sep)
+        if product == 0x1205 and "input2" in ev and not uhid:
+            return node
+        if virtual is None and (uhid or product in emulated):
+            virtual = node
+    return virtual
 
 
 class ChordWatcher:
